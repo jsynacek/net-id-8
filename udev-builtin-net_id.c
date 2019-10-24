@@ -90,16 +90,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <linux/pci_regs.h>
-
-#include "dirent-util.h"
-#include "fd-util.h"
-#include "fileio.h"
-#include "fs-util.h"
-#include "parse-util.h"
-#include "stdio-util.h"
-#include "string-util.h"
-#include "udev.h"
-#include "udev-util.h"
+#include <libudev.h>
+#include "util.h"
 
 #define ONBOARD_INDEX_MAX (16*1024-1)
 
@@ -150,11 +142,18 @@ static struct udev_device *skip_virtio(struct udev_device *dev) {
         return parent;
 }
 
+static int chase_symlinks(const char *path, const char *unused1, int unused2, char **ret) {
+        *ret = realpath(path, NULL);
+        if (!*ret)
+                return -ENOMEM;
+        return 0;
+}
+
 static int get_virtfn_info(struct udev_device *dev, struct netnames *names, struct virtfn_info *vf_info) {
         struct udev *udev;
         const char *physfn_link_file;
-        _cleanup_free_ char *physfn_pci_syspath = NULL;
-        _cleanup_free_ char *virtfn_pci_syspath = NULL;
+        char *physfn_pci_syspath = NULL;
+        char *virtfn_pci_syspath = NULL;
         struct dirent *dent;
         _cleanup_closedir_ DIR *dir = NULL;
         struct virtfn_info vf_info_local = {};
@@ -181,7 +180,7 @@ static int get_virtfn_info(struct udev_device *dev, struct netnames *names, stru
                 goto out_unref;
         }
         FOREACH_DIRENT_ALL(dent, dir, break) {
-                _cleanup_free_ char *virtfn_link_file = NULL;
+                char *virtfn_link_file = NULL;
                 if (!startswith(dent->d_name, "virtfn"))
                         continue;
                 virtfn_link_file = strjoin(physfn_pci_syspath, "/", dent->d_name);
@@ -291,7 +290,8 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
         size_t l;
         char *s;
         const char *attr, *port_name;
-        _cleanup_(udev_device_unrefp) struct udev_device *pci = NULL;
+        /*_cleanup_(udev_device_unrefp) struct udev_device *pci = NULL; */
+	struct udev_device *pci = NULL;
         struct udev_device *hotplug_slot_dev;
         char slots[PATH_MAX];
         _cleanup_closedir_ DIR *dir = NULL;
@@ -346,7 +346,7 @@ static int dev_pci_slot(struct udev_device *dev, struct netnames *names) {
                         unsigned i;
                         int r;
                         char str[PATH_MAX];
-                        _cleanup_free_ char *address = NULL;
+                        char *address = NULL;
 
                         if (dent->d_name[0] == '.')
                                 continue;
@@ -615,7 +615,7 @@ static int names_ccw(struct  udev_device *dev, struct netnames *names) {
 
         /* Network devices are either single or grouped CCW devices */
         subsys = udev_device_get_subsystem(cdev);
-        if (!STRPTR_IN_SET(subsys, "ccwgroup", "ccw"))
+        if (!(streq(subsys, "ccwgroup") || streq(subsys, "ccw")))
                 return -ENOENT;
 
         /* Retrieve bus-ID of the CCW device.  The bus-ID uniquely
@@ -631,7 +631,7 @@ static int names_ccw(struct  udev_device *dev, struct netnames *names) {
          * verify each bus-ID part...
          */
         bus_id_len = strlen(bus_id);
-        if (!IN_SET(bus_id_len, 8, 9))
+        if (!(bus_id_len == 8 || bus_id_len == 9))
                 return -EINVAL;
 
         /* Strip leading zeros from the bus id for aesthetic purposes. This
@@ -694,7 +694,8 @@ static int ieee_oui(struct udev_device *dev, struct netnames *names, bool test) 
         xsprintf(str, "OUI:%02X%02X%02X%02X%02X%02X", names->mac[0],
                  names->mac[1], names->mac[2], names->mac[3], names->mac[4],
                  names->mac[5]);
-        udev_builtin_hwdb_lookup(dev, NULL, str, NULL, test);
+        /* TODO: Do we need this? */
+	/* udev_builtin_hwdb_lookup(dev, NULL, str, NULL, test); */
         return 0;
 }
 
@@ -748,7 +749,8 @@ static int builtin_net_id(struct udev_device *dev, int argc, char *argv[], bool 
                 xsprintf(str, "%sx%02x%02x%02x%02x%02x%02x", prefix,
                          names.mac[0], names.mac[1], names.mac[2],
                          names.mac[3], names.mac[4], names.mac[5]);
-                udev_builtin_add_property(dev, test, "ID_NET_NAME_MAC", str);
+
+		udev_builtin_add_property(dev, test, "ID_NET_NAME_MAC", str);
 
                 ieee_oui(dev, &names, test);
         }
@@ -843,8 +845,26 @@ out:
         return EXIT_SUCCESS;
 }
 
-const struct udev_builtin udev_builtin_net_id = {
-        .name = "net_id",
-        .cmd = builtin_net_id,
-        .help = "Network device properties",
-};
+int main(int argc, char **argv)
+{
+        struct udev *udev;
+        struct udev_device *d;
+
+        if (argc <= 1) {
+                fprintf(stderr, "usage: %s /sys/class/net/<interface>\n", argv[0]);
+                return EXIT_FAILURE;
+        }
+
+        udev = udev_new();
+        if (udev == NULL) {
+                fprintf(stderr, "can't init udev");
+                return EXIT_FAILURE;
+        }
+
+        d = udev_device_new_from_syspath(udev, argv[1]);
+        if (d == NULL) {
+                fprintf(stderr, "device not found\n");
+                return EXIT_FAILURE;
+        }
+        return builtin_net_id(d, 0, NULL, false);
+}
